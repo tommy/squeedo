@@ -12,60 +12,97 @@
 ;; and limitations under the License.
 (ns com.climate.squeedo.sqs-consumer
   "Functions for using Amazon Simple Queueing Service to request and perform
- computation."
+  computation."
   (:require
-    [clojure.core.async :refer [close! go-loop go >! <! <!! >!! chan buffer onto-chan]]
+    [clojure.core.async :refer [close! go-loop go thread >! <! <!! chan buffer onto-chan timeout]]
     [clojure.core.async.impl.protocols :refer [closed?]]
-    [com.climate.squeedo.sqs :as gsqs]
-    [clojure.tools.logging :as log]))
+    [clojure.tools.logging :as log]
+    [com.climate.squeedo.sqs :as sqs]))
 
-(defn- create-queue-listener
-  " kick off a listener in the background that eagerly grabs messages as quickly
-    as possible and fetches them into a buffered channel.  This will park the thread
-    if the message channel is full. (ie. don't prefetch too many messages as there is a memory
-    impact, and they have to get processed before timing out.)
-  "
-  [connection num-listeners buffer-size dequeue-limit]
+(defn- create-queue-listeners
+  "Kick off listeners in the background that eagerly grab messages as quickly as possible and fetch them into a buffered
+  channel.
+
+  This will park the thread if the message channel is full. (ie. don't prefetch too many messages as there is
+  a memory impact, and they have to get processed before timing out.)
+
+  If there is an Exception while trying to poll for messages, wait exceptional-poll-delay-ms before trying again."
+  [connection num-listeners buffer-size dequeue-limit exceptional-poll-delay-ms]
   (let [buf (buffer buffer-size)
-        message-channel (chan buf)]
+        message-chan (chan buf)]
     (dotimes [_ num-listeners]
-      (go (while
-            (let [messages (gsqs/dequeue connection :limit dequeue-limit)]
+      (go-loop []
+        (try
+          (let [messages (sqs/dequeue* connection :limit dequeue-limit)]
+            ; park until all messages are put onto message-channel
+            (<! (onto-chan message-chan messages false)))
+          (catch Throwable t
+            (log/errorf t "Encountered exception dequeueing.  Waiting %d ms before trying again." exceptional-poll-delay-ms)
+            (<! (timeout exceptional-poll-delay-ms))))
+        (when (not (closed? message-chan))
+          (recur))))
+    [message-chan buf]))
+
+(defn- create-dedicated-queue-listeners
+  "Similar to `create-queue-listeners` but listeners are created on dedicated threads and will be blocked when the
+  message channel is full.  Potentially useful when consuming from large numbers of SQS queues within a single program.
+
+  If there is an Exception while trying to poll for messages, wait exceptional-poll-delay-ms before trying again."
+  [connection num-listeners buffer-size dequeue-limit exceptional-poll-delay-ms]
+  (let [buf (buffer buffer-size)
+        message-chan (chan buf)]
+    (dotimes [_ num-listeners]
+      (thread
+        (loop []
+          (try
+            (let [messages (sqs/dequeue* connection :limit dequeue-limit)]
               ; block until all messages are put onto message-channel
-              (<! (onto-chan message-channel messages false))
-              (not (closed? message-channel))))))
-    [message-channel buf]))
+              (<!! (onto-chan message-chan messages false)))
+            (catch Throwable t
+              (log/errorf t "Encountered exception dequeueing.  Waiting %d ms before trying again." exceptional-poll-delay-ms)
+              (Thread/sleep exceptional-poll-delay-ms)))
+          (when (not (closed? message-chan))
+            (recur)))))
+    [message-chan buf]))
+
+(defn- worker
+  [work-token-chan message-chan compute done-chan]
+  (go-loop []
+    (>! work-token-chan :token)
+    (when-let [message (<! message-chan)]
+      (try
+        (compute message done-chan)
+        (catch Throwable _
+          (>! done-chan (assoc message :nack true))))
+      (recur))))
+
+(defn- acker
+  [connection work-token-chan done-chan]
+  (go-loop []
+    (when-let [message (<! done-chan)]
+      ; free up the work-token-chan
+      (<! work-token-chan)
+      ; (n)ack the message asynchronously
+      (let [nack (:nack message)]
+        (go
+          (cond
+            (integer? nack) (sqs/nack connection message (:nack message))
+            nack            (sqs/nack connection message)
+            :else           (sqs/ack connection message))))
+      (recur))))
 
 (defn- create-workers
   "Create workers to run the compute function. Workers are expected to be CPU bound or handle all IO in an asynchronous
-  manner.  In the future we may add an option to run computes in a thread/pool that isn't part of the core.async's
+  manner. In the future we may add an option to run computes in a thread/pool that isn't part of the core.async's
   threadpool."
-  [connection worker-size max-concurrent-work message-channel compute]
-  (let [done-channel (chan worker-size)
+  [connection worker-size max-concurrent-work message-chan compute]
+  (let [done-chan (chan worker-size)
         ; the work-token-channel ensures we only have a fixed numbers of messages processed at one time
-        work-token-channel (chan max-concurrent-work)]
+        work-token-chan (chan max-concurrent-work)]
     (dotimes [_ worker-size]
-      (go-loop []
-        (>! work-token-channel :token)
-        (when-let [message (<! message-channel)]
-          (try
-            (compute message done-channel)
-            (catch Throwable t
-              (log/error t "Error thrown by compute, saving go block and nacking message")
-              (>! done-channel (assoc message :nack true))))
-          (recur))))
-
-    (go-loop []
-      (when-let [message (<! done-channel)]
-        (do
-          ; free up the work-token-channel
-          (<! work-token-channel)
-          ; (n)ack the message asynchronously
-          (if (:nack message)
-            (go (gsqs/nack connection message))
-            (go (gsqs/ack connection message)))
-          (recur))))
-    done-channel))
+      (worker work-token-chan message-chan compute done-chan))
+    (acker connection work-token-chan done-chan)
+    done-chan))
 
 (defn- ->options-map
   "If options are provided as a map, return it as-is; otherwise, the options are provided as varargs and must be
@@ -81,11 +118,6 @@
   []
   (.availableProcessors (Runtime/getRuntime)))
 
-(defn- get-dead-letter-queue-name
-  [queue-name options]
-  (or (:dl-queue-name options)
-      (str queue-name "-failed")))
-
 (defn- get-worker-count
   [options]
   (or (:num-workers options)
@@ -95,6 +127,10 @@
   [worker-count options]
   (or (:num-listeners options)
       (max 1 (int (/ worker-count 10)))))
+
+(defn- get-listener-threads
+  [options]
+  (or (:listener-threads? options) false))
 
 (defn- get-message-channel-size
   [listener-count options]
@@ -111,6 +147,19 @@
   (or (:dequeue-limit options)
       10))
 
+(defn- get-exceptional-poll-delay-ms
+  [options]
+  (or (:exceptional-poll-delay-ms options)
+      10000))
+
+(defn- dead-letter-deprecation-warning
+  [options]
+  (when (:dl-queue-name options)
+    (println
+      (str "WARNING - :dl-queue-name option for com.climate.squeedo.sqs-consumer/start-consumer"
+           " has been removed. Please use com.climate.squeedo.sqs/configure to configure an SQS"
+           " dead letter queue."))))
+
 (defn start-consumer
   "Creates a consumer that reads messages as quickly as possible into a local buffer up
    to the configured buffer size.
@@ -126,43 +175,44 @@
 
    This code is atom free :)
 
-   inputs:
-    queue-name - the name of an sqs queue (will be created if necessary)
-
+   Input:
+    queue-name - the name of an sqs queue
     compute - a compute function that takes two args: a 'message' containing the body of the sqs
               message and a channel on which to ack/nack when done.
-    opts -
-       :message-channel-size : the number of messages to prefetch from sqs; default 20 * num-listeners
-       :num-workers : the number of workers processing messages concurrently
-       :num-listeners : the number of listeners polling from sqs. default is (num-workers / 10)
-                        since each listener dequeues up to 10 messages at a time
-       :dequeue-limit : the number of messages to dequeue at a time; default 10
-       :max-concurrent-work : the maximum number of total messages processed.  This is mainly for
-                        asynch workflows; default num-workers
-       :dl-queue-name : the dead letter queue to which messages that are failed the maximum number of
-                        times will go (will be created if necessary).
-                        Defaults to (str queue-name \"-failed\")
-       :client        : the bandalore sqs client to use (if missing, sqs/mk-connection will create
-                        the client)
-   outputs:
-    a map with keys, :done-channel - the channel to send messages to be acked
-                     :message-channel - unused by the client.
-  "
+
+   Optional arguments:
+    :message-channel-size      - the number of messages to prefetch from sqs; default 20 * num-listeners
+    :num-workers               - the number of workers processing messages concurrently
+    :num-listeners             - the number of listeners polling from sqs; default is (num-workers / 10) because each
+                                 listener dequeues up to 10 messages at a time
+    :listener-threads?         - run listeners in dedicated threads; if true, will create one thread per listener
+    :dequeue-limit             - the number of messages to dequeue at a time; default 10
+    :max-concurrent-work       - the maximum number of total messages processed.  This is mainly for async workflows;
+                                 default num-workers
+    :client                    - the SQS client to use (if missing, sqs/mk-connection will create a client)
+    :exceptional-poll-delay-ms - when an Exception is received while polling, the number of ms we wait until polling
+                                 again.  Default is 10000 (10 seconds).
+   Output:
+    a map with keys, :done-channel    - the channel to send messages to be acked
+                     :message-channel - unused by the client."
   [queue-name compute & opts]
   (let [options (->options-map opts)
-        dead-letter-queue-name (get-dead-letter-queue-name queue-name options)
-        connection (gsqs/mk-connection queue-name
-                                       :dead-letter dead-letter-queue-name
-                                       :client      (:client options))
+        _ (dead-letter-deprecation-warning options)
+        connection (sqs/mk-connection queue-name :client (:client options))
         worker-count (get-worker-count options)
         listener-count (get-listener-count worker-count options)
-        message-channel-size (get-message-channel-size listener-count options)
+        message-chan-size (get-message-channel-size listener-count options)
         max-concurrent-work (get-max-concurrent-work worker-count options)
         dequeue-limit (get-dequeue-limit options)
-        message-channel (first (create-queue-listener
-                                 connection listener-count message-channel-size dequeue-limit))
-        done-channel (create-workers connection worker-count max-concurrent-work message-channel compute)]
-    {:done-channel done-channel :message-channel message-channel}))
+        exceptional-poll-delay-ms (get-exceptional-poll-delay-ms options)
+        [message-chan _] (if (get-listener-threads options)
+                           (create-dedicated-queue-listeners
+                             connection listener-count message-chan-size dequeue-limit exceptional-poll-delay-ms)
+                           (create-queue-listeners
+                             connection listener-count message-chan-size dequeue-limit exceptional-poll-delay-ms))
+        done-chan (create-workers
+                    connection worker-count max-concurrent-work message-chan compute)]
+    {:done-channel done-chan :message-channel message-chan}))
 
 (defn stop-consumer
   "Takes a consumer created by start-consumer and closes the channels.

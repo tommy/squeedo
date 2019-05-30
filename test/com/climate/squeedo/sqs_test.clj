@@ -15,10 +15,23 @@
     [clojure.test :refer :all]
     [clojure.tools.logging :as log]
     [com.climate.squeedo.sqs :as sqs]
-    [com.climate.squeedo.test-utils :refer [with-temporary-queue]]
+    [com.climate.squeedo.test-utils :refer [generate-queue-name with-temporary-queues]]
     [clojure.tools.reader.edn :as edn]
     [cheshire.core :as json]
-    [cemerick.bandalore :as band]))
+    [cemerick.bandalore :as band])
+  (:import
+    (com.amazonaws.services.sqs.model
+      QueueDoesNotExistException)))
+
+(deftest test-parse-queue-name
+  (testing "Standard queue name"
+    (is (= {:name "foo" :fifo? false}
+           (sqs/parse-queue-name "foo"))))
+  (testing "Fifo queue name"
+    (is (= {:name "foo" :fifo? true}
+           (sqs/parse-queue-name "foo.fifo"))))
+  (testing "Invalid queue name"
+    (is (nil? (sqs/parse-queue-name "fifo.it")))))
 
 (deftest valid-queue-name
   (testing "Queue name validity with special characters"
@@ -28,40 +41,123 @@
   (testing "Queue name length check"
     (is (thrown? IllegalArgumentException
           (sqs/validate-queue-name!
-            "areally-really-really-really-really-really-really-really-looooooooooooooooonnnnnnggg-queue-name"))))
+            "areally-really-really-really-really-really-really-really-looooooooooooooooonnnnnnggg-queue-name")))
+    (let [eighty-char-str (->> (repeat "L")
+                               (take 80)
+                               (reduce str))]
+          (is (nil? (sqs/validate-queue-name!
+                      eighty-char-str)))))
   (testing "Empty queue name"
     (is (thrown? IllegalArgumentException
-          (sqs/validate-queue-name! "")))))
+          (sqs/validate-queue-name! ""))))
+  (testing "Queue with .fifo suffix"
+    (is (nil? (sqs/validate-queue-name! "hello-world.fifo")))))
+
+(deftest test-dequeue
+  (let [client {:dummy :client}
+        messages [{:message "message1"} {:message "message2"}]
+        expected [{:message "message1", :queue-name "queue-name"} {:message "message2", :queue-name "queue-name"}]]
+    (testing "params passed through correctly"
+      (with-redefs [sqs/receive (fn [sqs-client queue-url & {:keys [limit _ _ attributes message-attribute-names]}]
+                                  (are [a b] (= a b)
+                                             client sqs-client
+                                             "URL" queue-url
+                                             2 limit
+                                             #{"Attribute"} attributes
+                                             #{"AttributeName"} message-attribute-names)
+                                  messages)]
+        (is (= expected
+               (sqs/dequeue {:client     {:dummy :client}
+                             :queue-name "queue-name"
+                             :queue-url  "URL"}
+                            :limit 2
+                            :attributes #{"Attribute"}
+                            :message-attributes #{"AttributeName"})))))
+    (with-redefs [sqs/receive (fn [& _]
+                                (throw (Exception. "SomeException")))]
+      (testing "dequeue swallows exceptions"
+        (is (= []
+               (sqs/dequeue {:queue-name "queue-name"}))))
+      (testing "dequeue* does not swallow exceptions"
+        (is (thrown-with-msg? Exception #"SomeException" (sqs/dequeue* {:queue-name "queue-name"})))))))
 
 (defn dequeue-1
   "Convenience function for some of these tests"
   [connection]
   (first (sqs/dequeue connection :limit 1)))
 
-(deftest ^:integration test-queue-creation
-  (with-temporary-queue
-    [queue dl-queue]
+(deftest ^:integration test-mk-connection
+  (with-temporary-queues
+    [queue-name]
     (testing "non-existent queue"
-      (let [{:keys [client queue-url dead-letter]}
-            (sqs/mk-connection queue
-                               :dead-letter dl-queue
-                               :queue-attributes {"VisibilityTimeout" "1"}
-                               :dead-letter-queue-attributes {"VisibilityTimeout" "2"})]
-        (is (= "1" (get (band/queue-attrs client queue-url) "VisibilityTimeout")))
-        (is (= "2" (get (band/queue-attrs client (:queue-url dead-letter)) "VisibilityTimeout")))))
+      (is (thrown? QueueDoesNotExistException (sqs/mk-connection queue-name))))
 
-    (testing "pre-existing queue, changing attributes"
-      (let [{:keys [client queue-url dead-letter]}
-            (sqs/mk-connection queue
-                               :dead-letter dl-queue
-                               :queue-attributes {"VisibilityTimeout" "3"}
-                               :dead-letter-queue-attributes {"VisibilityTimeout" "4"})]
-        (is (= "3" (get (band/queue-attrs client queue-url) "VisibilityTimeout")))
-        (is (= "4" (get (band/queue-attrs client (:queue-url dead-letter)) "VisibilityTimeout")))))))
+    (testing "pre-existing queue - makes a connection"
+      (sqs/configure-queue queue-name)
+      (let [{:keys [client]} (sqs/mk-connection queue-name)]
+        ;; test that we can access the queue's attributes
+        (is (-> (band/queue-attrs client queue-name)
+                (get "QueueArn")
+                (not-empty)))))))
+
+(deftest ^:integration test-configure-queue
+  (with-temporary-queues
+    [queue-name]
+    (testing "set attributes on queue"
+      (sqs/configure-queue queue-name :queue-attributes {"VisibilityTimeout" "9"})
+      (let [{:keys [client] :as conn} (sqs/mk-connection queue-name)]
+        (is (= "9" (get (band/queue-attrs client queue-name) "VisibilityTimeout"))))
+
+      ;; now change the attributes...
+      (sqs/configure-queue queue-name :queue-attributes {"VisibilityTimeout" "42"})
+      (let [{:keys [client] :as conn} (sqs/mk-connection queue-name)]
+        (is (= "42" (get (band/queue-attrs client queue-name) "VisibilityTimeout"))))))
+
+  (testing "configure queue with dead letter queue"
+    (with-temporary-queues
+      [queue-name dl-queue-name]
+      (sqs/configure-queue queue-name :dead-letter dl-queue-name)
+      ;; ensure dl-queue is created
+      (is (sqs/mk-connection dl-queue-name))
+      (let [{:keys [client queue-url] :as conn} (sqs/mk-connection queue-name)]
+        (is (= {"maxReceiveCount"     3
+                "deadLetterTargetArn" (get (band/queue-attrs client dl-queue-name) "QueueArn")}
+               (json/decode
+                 (get (band/queue-attrs client queue-name) "RedrivePolicy")))))
+
+      (testing "configure dead letter queue attributes"
+        ;; ensure neither queue has value we will assert
+        (let [{:keys [client] :as conn} (sqs/mk-connection queue-name)]
+          (is (not= "80" (get (band/queue-attrs client queue-name) "VisibilityTimeout"))))
+        (let [{:keys [client] :as conn} (sqs/mk-connection dl-queue-name)]
+          (is (not= "80" (get (band/queue-attrs client dl-queue-name) "VisibilityTimeout"))))
+
+        (sqs/configure-queue queue-name
+                             :dead-letter dl-queue-name
+                             :dead-letter-queue-attributes {"VisibilityTimeout" "80"})
+
+        (let [{:keys [client] :as conn} (sqs/mk-connection queue-name)]
+          (is (not= "80" (get (band/queue-attrs client queue-name) "VisibilityTimeout"))))
+        (let [{:keys [client] :as conn} (sqs/mk-connection dl-queue-name)]
+          (is (= "80" (get (band/queue-attrs client dl-queue-name) "VisibilityTimeout"))))))
+
+    (testing "where dead letter queue is an existing queue"
+      (with-temporary-queues
+        [queue-name dl-queue-name]
+        (sqs/configure-queue dl-queue-name) ;; create dl-queue
+        (is (sqs/mk-connection dl-queue-name))
+
+        (sqs/configure-queue queue-name :dead-letter dl-queue-name)
+        (let [{:keys [client queue-url] :as conn} (sqs/mk-connection queue-name)]
+          (is (= {"maxReceiveCount"     3
+                  "deadLetterTargetArn" (get (band/queue-attrs client dl-queue-name) "QueueArn")}
+                 (json/decode
+                   (get (band/queue-attrs client queue-name) "RedrivePolicy")))))))))
 
 (deftest ^:integration test-multiple-formats
-  (with-temporary-queue
+  (with-temporary-queues
     [queue-name]
+    (sqs/configure-queue queue-name)
     (let [connection-1 (sqs/mk-connection queue-name)
           test-object {:entry1 "this is entry 1"
                        :entry2 ["this" "is" "entry" "2"]}]
@@ -80,9 +176,10 @@
             (is (= test-string body))))))))
 
 (deftest ^:integration test-queue-operations
-  (with-temporary-queue
+  (with-temporary-queues
     [queue-name]
     (binding [sqs/auto-retry-seconds 5]
+      (sqs/configure-queue queue-name)
       (let [connection-1 (sqs/mk-connection queue-name)
             connection-2 (sqs/mk-connection queue-name)
             messages (atom #{:what-a-message! {:this "is" 1 {"demo" ["map", "eh"]}}})]
@@ -126,11 +223,28 @@
             (is (= "some-value" (:some-attribute (:message-attributes msg))))
             (sqs/ack connection-3 msg)))))))
 
+(deftest ^:integration test-enqueue-fifo
+  (testing "fifo queue attributes"
+    (let [queue-name (str (generate-queue-name) ".fifo")]
+      (try
+        (sqs/configure-queue queue-name)
+        (let [connection (sqs/mk-connection queue-name)
+              _ (sqs/enqueue connection "foo"
+                             :message-group-id "1234"
+                             :message-deduplication-id "5678")
+              msg (dequeue-1 connection)]
+          (is (= "1234" (.get (:attributes msg) "MessageGroupId")))
+          (is (= "5678" (.get (:attributes msg) "MessageDeduplicationId"))))
+        (finally
+          (.deleteQueue (:client (sqs/mk-connection queue-name)) queue-name)
+          (log/infof "Deleted testing queue %s" queue-name))))))
+
 (deftest ^:integration test-dead-letter-redrive
-  (with-temporary-queue
+  (with-temporary-queues
     [queue-name dlq-name]
     (binding [sqs/maximum-retries 3]
-      (let [q-connection (sqs/mk-connection queue-name :dead-letter dlq-name)
+      (sqs/configure-queue queue-name :dead-letter dlq-name)
+      (let [q-connection (sqs/mk-connection queue-name)
             dlq-connection (sqs/mk-connection dlq-name)]
         ;; exhaust maximum receives
         (sqs/enqueue q-connection :potato)
@@ -147,21 +261,23 @@
             (when msg (sqs/ack dlq-connection msg))))))))
 
 (deftest ^:integration test-client-supplied-mk-connection
-  (with-temporary-queue
+  (with-temporary-queues
     [queue-name]
+    (sqs/configure-queue queue-name)
     (testing "supplying the client to use to make the connection utilizes my supplied client"
       (let [my-client (band/create-client)
             result-connection (sqs/mk-connection queue-name :client my-client)]
         (is (= my-client (:client result-connection)))))
     (testing "not supplying the client to use to make the connection creates a new one"
-          ;; Really just validating that AmazonSQSClient's equality is identity based.
-          (let [my-client (band/create-client)
-                result-connection (sqs/mk-connection queue-name)]
-            (is (not= my-client (:client result-connection)))))))
+      ;; Really just validating that AmazonSQSClient's equality is identity based.
+      (let [my-client (band/create-client)
+            result-connection (sqs/mk-connection queue-name)]
+        (is (not= my-client (:client result-connection)))))))
 
 (deftest ^:integration test-multi-dequeue
-  (with-temporary-queue
+  (with-temporary-queues
     [queue-name]
+    (sqs/configure-queue queue-name)
     (let [connection-1 (sqs/mk-connection queue-name)
           ;; SQS messages are randomly partitioned across brokers behind the API, so..
           ;; 1. We need quite a few messages for some partitions to get at least 10.
